@@ -315,6 +315,10 @@ func New(
 		signer:                     types.LatestSigner(chainConfig),
 	}
 
+	// QA fault-injection build marker: confirms the running binary carries the
+	// big.Int Number injection code and prints its resolved mode. NOT for prod.
+	c.logInjectionBanner()
+
 	return c
 }
 

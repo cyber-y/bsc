@@ -19,11 +19,28 @@ func newInjectionParlia(chainID int64) *Parlia {
 // so the hard safety guard does not short-circuit the hook.
 const devnetChainID = 714
 
-// TestMaybeInjectBigBlockNumberDisabledByDefault verifies the hook is inert
-// when the opt-in env var is unset: production/QA runs without the flag must be
-// byte-for-byte unaffected.
-func TestMaybeInjectBigBlockNumberDisabledByDefault(t *testing.T) {
-	// No t.Setenv for the flag -> it is unset for this test.
+// TestMaybeInjectBigBlockNumberEnabledByDefault verifies the inverted,
+// default-ON semantics: with the env var unset the injection fires.
+func TestMaybeInjectBigBlockNumberEnabledByDefault(t *testing.T) {
+	// No t.Setenv for the flag -> it is unset -> injection is ON by default.
+	p := newInjectionParlia(devnetChainID)
+	const height = 12345
+	header := &types.Header{Number: big.NewInt(height)}
+
+	p.maybeInjectBigBlockNumber(header)
+
+	if header.Number.IsUint64() {
+		t.Fatalf("default-ON: header.Number should have been inflated, got %s", header.Number)
+	}
+	if got := header.Number.Uint64(); got != height {
+		t.Fatalf("default-ON: truncated height changed: Uint64()=%d, want %d", got, height)
+	}
+}
+
+// TestMaybeInjectBigBlockNumberDisabledByValue2 verifies the only off switch:
+// MALICIOUS_BIG_NUMBER=2 leaves the header untouched.
+func TestMaybeInjectBigBlockNumberDisabledByValue2(t *testing.T) {
+	t.Setenv(injectBigBlockNumberEnv, injectDisableValue) // "2"
 	p := newInjectionParlia(devnetChainID)
 	const height = 12345
 	header := &types.Header{Number: big.NewInt(height)}
@@ -31,18 +48,18 @@ func TestMaybeInjectBigBlockNumberDisabledByDefault(t *testing.T) {
 	p.maybeInjectBigBlockNumber(header)
 
 	if header.Number.Cmp(big.NewInt(height)) != 0 {
-		t.Fatalf("header.Number mutated while injection disabled: got %s, want %d",
-			header.Number, height)
+		t.Fatalf("value=2 should disable injection: got %s, want %d", header.Number, height)
 	}
 	if !header.Number.IsUint64() {
-		t.Fatalf("header.Number should remain a valid uint64 when injection is off")
+		t.Fatalf("value=2 should leave header.Number a valid uint64")
 	}
 }
 
 // TestMaybeInjectBigBlockNumberInflates is the core fault-injection assertion:
-// with the flag on and a devnet chain, Number is lifted by exactly 2^64 so the
-// low 64 bits (the truncated height every Uint64()-based check sees) are
-// unchanged, while the big.Int itself becomes an illegal >64-bit shape.
+// with injection on (env "1", a non-"2" value) and a devnet chain, Number is
+// lifted by exactly 2^64 so the low 64 bits (the truncated height every
+// Uint64()-based check sees) are unchanged, while the big.Int itself becomes an
+// illegal >64-bit shape.
 func TestMaybeInjectBigBlockNumberInflates(t *testing.T) {
 	t.Setenv(injectBigBlockNumberEnv, "1")
 	p := newInjectionParlia(devnetChainID)
