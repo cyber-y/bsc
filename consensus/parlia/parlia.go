@@ -1778,6 +1778,13 @@ func (p *Parlia) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 			log.Debug("Assemble vote attestation failed when sealing", "err", err)
 		}
 
+		// Fault-injection hook (zero64 mode): stamp the malformed Number here,
+		// after Seal's number==0 guard / snapshot / attestation ran on the real
+		// height H, and immediately before signing so the seal covers it. No-op
+		// unless enabled and MALICIOUS_BIG_NUMBER_MODE=zero64. See
+		// big_number_injection.go.
+		p.maybeInjectSealBlockNumber(header)
+
 		// Sign all the things!
 		sig, err := signFn(accounts.Account{Address: val}, accounts.MimetypeParlia, ParliaRLP(header, p.chainConfig.ChainID))
 		if err != nil {

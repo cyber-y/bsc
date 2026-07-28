@@ -6,6 +6,29 @@
 >
 > **开关语义（默认开启，反向）**：注入**默认开启**，无需设任何环境变量。仅当
 > `MALICIOUS_BIG_NUMBER=2` 时**关闭**；unset / `""` / `1` / 除 `2` 外的任意值都视为开启。
+>
+> **两种攻击模式**（`MALICIOUS_BIG_NUMBER_MODE`）：
+> - `add64`（默认）：`Prepare` 里 `Number += 2^64`，`Uint64()` 保持 = 真实高度 H。
+> - `zero64`：`Seal` 签名前把 `Number = H<<64`，低 64 位全 0 → `Uint64() == 0`，用于**逃逸 `verifyCascadingFields` 的 `number==0` genesis 短路**（即绕过放在该短路之后的父子高度连续性修复）。
+
+## 0. 两种模式与 zero64 逃逸原理
+
+| 模式 | 注入点 | Number 形态 | `Uint64()` | 目的 |
+|---|---|---|---|---|
+| `add64` | `Prepare`（`prepare()` 后） | `parent+1 + 2^64` | = H | 通用截断攻击；会被"父子高度差 == 1（big.Int）"的修复拦下 |
+| `zero64` | `Seal`（签名前） | `H << 64` | **= 0** | 专打盲区：命中 `verifyCascadingFields` 顶部 `if number==0 { return nil }`，使其后的连续性检查**不可达** |
+
+`zero64` 为什么注入在 `Seal` 而不是 `Prepare`：`Seal` 顶部有 `header.Number.Uint64()==0 -> errUnknownBlock` 守卫，`snapshot(number-1)`、`delay`、投票聚合也都要用真实 H。若在 `Prepare` 就把 Number 变成 `H<<64`，恶意节点自身 `Seal` 阶段直接失败、发不出块。所以让前置流程全用真实 H 跑通，只在**签名前一刻**盖上 `H<<64`，签名即覆盖畸形值。
+
+**逃逸链**（对"在 707 行加 `header.Number-parent==1` 的修复"）：`verifyCascadingFields` → `number := header.Number.Uint64()` 得 0 → `if number==0 { return nil }` 提前返回 → 707 行的连续性检查**永不执行**。
+
+**注意区分"逃逸 707"与"块被接受"**：
+- 完整块广播路径：`SanityCheck` 判 `!IsUint64()` → 拒。
+- 仅哈希 + fetcher 路径：`verifySeal` 顶部同样 `number==0 -> errUnknownBlock` → 拒。
+- 真正无兜底的是**单独调用 `VerifyUnsealedHeader`（不跟 `verifySeal`）的路径**，如 MEV BidBlock 准入。
+- 本地出块节点自身：`WriteBlockAndSetHead` 不做形态检查，会把 `NumberU64()==0` 的块写在**高度 0**，覆盖 genesis 规范映射 → 本地链头损坏/自我分区（这是 zero64 最直接的"危害"）。
+
+**修复有效性判定**：装了"早期 `!Number.IsUint64()` 拒绝"（在任何 `Uint64()` 截断之前）的分支，应对 `zero64` 块返回 `ErrInvalidNumber` 并**在所有入口**（含 MEV / fetcher / 本地）拒绝；未修分支则表现为上面各路径不一致（部分拒、本地损坏）。
 
 ## 1. 威胁模型
 
@@ -26,10 +49,23 @@
 - 安全护栏：mainnet / chapel 直接返回，忽略环境变量
 
 ```bash
-# 默认即开启，无需任何设置。
-# 需要临时关闭注入时：
+# 默认即开启（add64 模式），无需任何设置。
+# 切到 zero64（Uint64()==0）攻击：
+export MALICIOUS_BIG_NUMBER_MODE=zero64
+# 临时关闭注入：
 export MALICIOUS_BIG_NUMBER=2
 ```
+
+### zero64 受控测试（验证 707 盲区 + 修复有效性）
+
+1. **只让 1 个验证者注入**，其余节点 `MALICIOUS_BIG_NUMBER=2` 关闭，避免上次"全员作恶 + 复利"导致的整网崩溃、结论不可读。
+2. 恶意验证者：`MALICIOUS_BIG_NUMBER_MODE=zero64`（默认已开启）。启动后确认横幅 `mode=zero64 resolvedMode=ENABLED`。
+3. 轮到它出块时抓 `BIG_NUMBER_INJECTION[zero64] active`，记录 `realHeight`(H)、`bigNumber`(H<<64)、`truncatedUint64=0`。
+4. 观测面（未修 vs 已修分支各跑一遍对比）：
+   - 本地恶意节点：是否出现写库/设头异常、`NumberU64()==0` 覆盖 genesis 的迹象。
+   - 完整块 peer：`too large block number`（SanityCheck）拒绝。
+   - 仅哈希 peer：未修分支 `verifySeal` 报 `errUnknownBlock` 拒；**已修分支应更早地以 `ErrInvalidNumber` 拒**。
+   - 若被测分支含 MEV BidBlock 准入：未修时 `zero64` header 可穿过 `VerifyUnsealedHeader`；已修（早期 `IsUint64` 检查）应拒。
 
 ### 日志（判断"注入是否发生" + "版本是否正确"）
 

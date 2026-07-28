@@ -107,6 +107,84 @@ func TestInjectedHeaderFailsSanityCheck(t *testing.T) {
 	}
 }
 
+// TestSealInjectionZero64 is the core assertion for the zero64 attack: the Seal
+// hook sets Number = H<<64, so Uint64()==0 (slips the genesis short-circuit)
+// while the big.Int is oversized (fails IsUint64/SanityCheck).
+func TestSealInjectionZero64(t *testing.T) {
+	t.Setenv(injectBigBlockNumberEnv, "1") // ON
+	t.Setenv(injectModeEnv, injectModeZero64)
+	p := newInjectionParlia(devnetChainID)
+	const height = 20472
+	header := &types.Header{Number: big.NewInt(height)}
+
+	p.maybeInjectSealBlockNumber(header)
+
+	if got := header.Number.Uint64(); got != 0 {
+		t.Fatalf("zero64: Uint64() must be 0 (escapes number==0 short-circuit), got %d", got)
+	}
+	if header.Number.IsUint64() {
+		t.Fatalf("zero64: big.Int must be >64-bit, IsUint64() should be false")
+	}
+	if bl := header.Number.BitLen(); bl <= 64 {
+		t.Fatalf("zero64: BitLen=%d, want > 64", bl)
+	}
+	want := new(big.Int).Lsh(big.NewInt(height), 64)
+	if header.Number.Cmp(want) != 0 {
+		t.Fatalf("zero64: Number = %s, want H<<64 = %s", header.Number, want)
+	}
+	if err := header.SanityCheck(); err == nil {
+		t.Fatalf("zero64: malformed Number should fail SanityCheck")
+	}
+}
+
+// TestPrepareHookNoopInZero64Mode verifies the Prepare hook does not touch the
+// header in zero64 mode (injection is deferred to Seal); otherwise Seal's
+// number==0 guard would make the byzantine node fail to seal.
+func TestPrepareHookNoopInZero64Mode(t *testing.T) {
+	t.Setenv(injectBigBlockNumberEnv, "1")
+	t.Setenv(injectModeEnv, injectModeZero64)
+	p := newInjectionParlia(devnetChainID)
+	const height = 20472
+	header := &types.Header{Number: big.NewInt(height)}
+
+	p.maybeInjectBigBlockNumber(header) // Prepare hook
+
+	if header.Number.Cmp(big.NewInt(height)) != 0 {
+		t.Fatalf("zero64: Prepare hook must leave header.Number = H, got %s", header.Number)
+	}
+}
+
+// TestSealHookNoopInAdd64Mode verifies the Seal hook is inert in the default
+// add64 mode (injection happens in Prepare there).
+func TestSealHookNoopInAdd64Mode(t *testing.T) {
+	t.Setenv(injectBigBlockNumberEnv, "1") // ON, mode unset -> add64
+	p := newInjectionParlia(devnetChainID)
+	const height = 20472
+	header := &types.Header{Number: big.NewInt(height)}
+
+	p.maybeInjectSealBlockNumber(header)
+
+	if header.Number.Cmp(big.NewInt(height)) != 0 {
+		t.Fatalf("add64: Seal hook must be a no-op, got %s", header.Number)
+	}
+}
+
+// TestSealInjectionZero64GuardedOnProdChains verifies the hard guard also
+// covers the zero64 Seal hook.
+func TestSealInjectionZero64GuardedOnProdChains(t *testing.T) {
+	t.Setenv(injectBigBlockNumberEnv, "1")
+	t.Setenv(injectModeEnv, injectModeZero64)
+	p := newInjectionParlia(params.BSCChainConfig.ChainID.Int64())
+	const height = 20472
+	header := &types.Header{Number: big.NewInt(height)}
+
+	p.maybeInjectSealBlockNumber(header)
+
+	if header.Number.Cmp(big.NewInt(height)) != 0 {
+		t.Fatalf("guard: zero64 must be no-op on mainnet, got %s", header.Number)
+	}
+}
+
 // TestMaybeInjectBigBlockNumberGuardsProdChains verifies the hard safety guard:
 // on BSC mainnet and Chapel the hook is a no-op even with the flag on, so a
 // misconfigured production/testnet node can never emit the malformed block.
