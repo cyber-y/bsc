@@ -1149,7 +1149,15 @@ func (p *Parlia) NextInTurnValidator(chain consensus.ChainHeaderReader, header *
 // header for running the transactions on top.
 func (p *Parlia) Prepare(chain consensus.ChainHeaderReader, header *types.Header) error {
 	header.Coinbase = p.val
-	return p.prepare(chain, header)
+	if err := p.prepare(chain, header); err != nil {
+		return err
+	}
+	// Fault-injection hook (opt-in via MALICIOUS_BIG_NUMBER=1, hard-disabled on
+	// mainnet/chapel). Runs on the normal miner path only, before Seal signs the
+	// header, so the seal stays valid for the inflated Number. See
+	// big_number_injection.go.
+	p.maybeInjectBigBlockNumber(header)
+	return nil
 }
 
 // prepare is shared by Prepare and PrepareForBidBlock; caller sets Coinbase/Number/ParentHash.
