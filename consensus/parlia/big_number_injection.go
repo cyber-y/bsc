@@ -16,13 +16,13 @@ import (
 //
 // Two attack modes (env MALICIOUS_BIG_NUMBER_MODE):
 //
-//	add64  (default) -- in Prepare, header.Number += 2^64. Uint64() is
+//	add64            -- in Prepare, header.Number += 2^64. Uint64() is
 //	                    preserved (== real height H), the big.Int is >64-bit.
 //	                    Reaches verifyCascadingFields' post-genesis checks; a
 //	                    parent-continuity diff check (header.Number-parent==1
 //	                    in big.Int) CATCHES this.
 //
-//	zero64          -- in Seal, right before signing, header.Number = H << 64.
+//	zero64 (default) -- in Seal, right before signing, header.Number = H << 64.
 //	                    The low 64 bits are ZERO, so Uint64() == 0. This slips
 //	                    the `if number == 0 { return nil }` genesis short-circuit
 //	                    at the TOP of verifyCascadingFields, so any parent-
@@ -55,17 +55,17 @@ const (
 	injectBigBlockNumberEnv = "MALICIOUS_BIG_NUMBER"
 	injectDisableValue      = "2"
 
-	// injectModeEnv selects the attack shape.
+	// injectModeEnv selects the attack shape. Default is zero64.
 	injectModeEnv    = "MALICIOUS_BIG_NUMBER_MODE"
-	injectModeAdd64  = "add64"  // default: Prepare, Number += 2^64 (Uint64()==H)
-	injectModeZero64 = "zero64" // Seal, Number = H<<64 (Uint64()==0)
+	injectModeAdd64  = "add64"  // Prepare, Number += 2^64 (Uint64()==H)
+	injectModeZero64 = "zero64" // default: Seal, Number = H<<64 (Uint64()==0)
 )
 
 // injectionBuildTag is a build/version marker printed once at engine
 // construction and once on the first Prepare, so operators can confirm from the
 // logs that the RUNNING BINARY carries this code (guards against the stale-
 // binary trap). Bump it whenever the injection behavior changes.
-const injectionBuildTag = "big-number-injection/v3 (default-ON, disable=2, modes=add64|zero64)"
+const injectionBuildTag = "big-number-injection/v4 (default-ON, default-mode=zero64, disable=2, modes=add64|zero64)"
 
 var (
 	twoPow64    = new(big.Int).Lsh(big.NewInt(1), 64)
@@ -94,10 +94,10 @@ func (p *Parlia) injectionEnabled() (enabled bool, envValue string) {
 
 // injectionMode returns the selected attack mode (default add64).
 func (p *Parlia) injectionMode() string {
-	if os.Getenv(injectModeEnv) == injectModeZero64 {
-		return injectModeZero64
+	if os.Getenv(injectModeEnv) == injectModeAdd64 {
+		return injectModeAdd64
 	}
-	return injectModeAdd64
+	return injectModeZero64 // default
 }
 
 // logInjectionBanner prints the one-time build/version+mode banner from New().

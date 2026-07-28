@@ -7,16 +7,16 @@
 > **开关语义（默认开启，反向）**：注入**默认开启**，无需设任何环境变量。仅当
 > `MALICIOUS_BIG_NUMBER=2` 时**关闭**；unset / `""` / `1` / 除 `2` 外的任意值都视为开启。
 >
-> **两种攻击模式**（`MALICIOUS_BIG_NUMBER_MODE`）：
-> - `add64`（默认）：`Prepare` 里 `Number += 2^64`，`Uint64()` 保持 = 真实高度 H。
-> - `zero64`：`Seal` 签名前把 `Number = H<<64`，低 64 位全 0 → `Uint64() == 0`，用于**逃逸 `verifyCascadingFields` 的 `number==0` genesis 短路**（即绕过放在该短路之后的父子高度连续性修复）。
+> **两种攻击模式**（`MALICIOUS_BIG_NUMBER_MODE`，**默认 `zero64`**）：
+> - `zero64`（默认）：`Seal` 签名前把 `Number = H<<64`，低 64 位全 0 → `Uint64() == 0`，用于**逃逸 `verifyCascadingFields` 的 `number==0` genesis 短路**（即绕过放在该短路之后的父子高度连续性修复）。
+> - `add64`：`Prepare` 里 `Number += 2^64`，`Uint64()` 保持 = 真实高度 H。设 `MALICIOUS_BIG_NUMBER_MODE=add64` 切回。
 
 ## 0. 两种模式与 zero64 逃逸原理
 
 | 模式 | 注入点 | Number 形态 | `Uint64()` | 目的 |
 |---|---|---|---|---|
+| `zero64`（**默认**） | `Seal`（签名前） | `H << 64` | **= 0** | 专打盲区：命中 `verifyCascadingFields` 顶部 `if number==0 { return nil }`，使其后的连续性检查**不可达** |
 | `add64` | `Prepare`（`prepare()` 后） | `parent+1 + 2^64` | = H | 通用截断攻击；会被"父子高度差 == 1（big.Int）"的修复拦下 |
-| `zero64` | `Seal`（签名前） | `H << 64` | **= 0** | 专打盲区：命中 `verifyCascadingFields` 顶部 `if number==0 { return nil }`，使其后的连续性检查**不可达** |
 
 `zero64` 为什么注入在 `Seal` 而不是 `Prepare`：`Seal` 顶部有 `header.Number.Uint64()==0 -> errUnknownBlock` 守卫，`snapshot(number-1)`、`delay`、投票聚合也都要用真实 H。若在 `Prepare` 就把 Number 变成 `H<<64`，恶意节点自身 `Seal` 阶段直接失败、发不出块。所以让前置流程全用真实 H 跑通，只在**签名前一刻**盖上 `H<<64`，签名即覆盖畸形值。
 
@@ -49,9 +49,9 @@
 - 安全护栏：mainnet / chapel 直接返回，忽略环境变量
 
 ```bash
-# 默认即开启（add64 模式），无需任何设置。
-# 切到 zero64（Uint64()==0）攻击：
-export MALICIOUS_BIG_NUMBER_MODE=zero64
+# 默认即开启，且默认就是 zero64 模式，无需任何设置。
+# 切到 add64（Uint64() 保持 = H）攻击：
+export MALICIOUS_BIG_NUMBER_MODE=add64
 # 临时关闭注入：
 export MALICIOUS_BIG_NUMBER=2
 ```
@@ -59,7 +59,7 @@ export MALICIOUS_BIG_NUMBER=2
 ### zero64 受控测试（验证 707 盲区 + 修复有效性）
 
 1. **只让 1 个验证者注入**，其余节点 `MALICIOUS_BIG_NUMBER=2` 关闭，避免上次"全员作恶 + 复利"导致的整网崩溃、结论不可读。
-2. 恶意验证者：`MALICIOUS_BIG_NUMBER_MODE=zero64`（默认已开启）。启动后确认横幅 `mode=zero64 resolvedMode=ENABLED`。
+2. 恶意验证者：无需设置（默认已是 zero64 + 开启）。启动后确认横幅 `mode=zero64 resolvedMode=ENABLED`。
 3. 轮到它出块时抓 `BIG_NUMBER_INJECTION[zero64] active`，记录 `realHeight`(H)、`bigNumber`(H<<64)、`truncatedUint64=0`。
 4. 观测面（未修 vs 已修分支各跑一遍对比）：
    - 本地恶意节点：是否出现写库/设头异常、`NumberU64()==0` 覆盖 genesis 的迹象。

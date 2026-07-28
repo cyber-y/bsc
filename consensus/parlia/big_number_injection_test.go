@@ -19,21 +19,33 @@ func newInjectionParlia(chainID int64) *Parlia {
 // so the hard safety guard does not short-circuit the hook.
 const devnetChainID = 714
 
-// TestMaybeInjectBigBlockNumberEnabledByDefault verifies the inverted,
-// default-ON semantics: with the env var unset the injection fires.
-func TestMaybeInjectBigBlockNumberEnabledByDefault(t *testing.T) {
-	// No t.Setenv for the flag -> it is unset -> injection is ON by default.
+// TestInjectionDefaultsToZero64OnDefault verifies the defaults: with both env
+// vars unset, injection is ON and the mode is zero64 -> the Seal hook fires
+// (Uint64()==0) and the Prepare hook is a no-op.
+func TestInjectionDefaultsToZero64OnDefault(t *testing.T) {
+	// No t.Setenv at all -> MALICIOUS_BIG_NUMBER unset (ON) and
+	// MALICIOUS_BIG_NUMBER_MODE unset (zero64).
 	p := newInjectionParlia(devnetChainID)
-	const height = 12345
-	header := &types.Header{Number: big.NewInt(height)}
-
-	p.maybeInjectBigBlockNumber(header)
-
-	if header.Number.IsUint64() {
-		t.Fatalf("default-ON: header.Number should have been inflated, got %s", header.Number)
+	if mode := p.injectionMode(); mode != injectModeZero64 {
+		t.Fatalf("default mode should be zero64, got %q", mode)
 	}
-	if got := header.Number.Uint64(); got != height {
-		t.Fatalf("default-ON: truncated height changed: Uint64()=%d, want %d", got, height)
+	const height = 12345
+
+	// Prepare hook is a no-op in the default (zero64) mode.
+	ph := &types.Header{Number: big.NewInt(height)}
+	p.maybeInjectBigBlockNumber(ph)
+	if ph.Number.Cmp(big.NewInt(height)) != 0 {
+		t.Fatalf("default zero64: Prepare hook must be no-op, got %s", ph.Number)
+	}
+
+	// Seal hook fires by default: Number = H<<64, Uint64()==0.
+	sh := &types.Header{Number: big.NewInt(height)}
+	p.maybeInjectSealBlockNumber(sh)
+	if got := sh.Number.Uint64(); got != 0 {
+		t.Fatalf("default zero64: Seal hook should force Uint64()==0, got %d", got)
+	}
+	if sh.Number.IsUint64() {
+		t.Fatalf("default zero64: Number should be >64-bit after Seal hook")
 	}
 }
 
@@ -62,6 +74,7 @@ func TestMaybeInjectBigBlockNumberDisabledByValue2(t *testing.T) {
 // illegal >64-bit shape.
 func TestMaybeInjectBigBlockNumberInflates(t *testing.T) {
 	t.Setenv(injectBigBlockNumberEnv, "1")
+	t.Setenv(injectModeEnv, injectModeAdd64) // Prepare-hook path
 	p := newInjectionParlia(devnetChainID)
 	const height = 12345
 	header := &types.Header{Number: big.NewInt(height)}
@@ -92,6 +105,7 @@ func TestMaybeInjectBigBlockNumberInflates(t *testing.T) {
 // probes for on paths that skip SanityCheck.
 func TestInjectedHeaderFailsSanityCheck(t *testing.T) {
 	t.Setenv(injectBigBlockNumberEnv, "1")
+	t.Setenv(injectModeEnv, injectModeAdd64) // Prepare-hook path
 	p := newInjectionParlia(devnetChainID)
 	header := &types.Header{Number: big.NewInt(999)}
 
@@ -157,7 +171,8 @@ func TestPrepareHookNoopInZero64Mode(t *testing.T) {
 // TestSealHookNoopInAdd64Mode verifies the Seal hook is inert in the default
 // add64 mode (injection happens in Prepare there).
 func TestSealHookNoopInAdd64Mode(t *testing.T) {
-	t.Setenv(injectBigBlockNumberEnv, "1") // ON, mode unset -> add64
+	t.Setenv(injectBigBlockNumberEnv, "1")
+	t.Setenv(injectModeEnv, injectModeAdd64) // explicit add64 (default is zero64)
 	p := newInjectionParlia(devnetChainID)
 	const height = 20472
 	header := &types.Header{Number: big.NewInt(height)}
